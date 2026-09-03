@@ -1,0 +1,269 @@
+name: Popup Launcher - Build APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: popup-launcher-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '17'
+  GRADLE_VERSION: '8.9'
+  ANDROID_API: '35'
+  BUILD_TOOLS: '35.0.0'
+
+jobs:
+  build:
+    name: Validate + Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Locate Android project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR=""
+
+          if [[ -f "settings.gradle.kts" || -f "settings.gradle" ]]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+            echo "Android project found at repository root."
+          else
+            echo "Searching for Android project..."
+
+            SETTINGS_FILE="$(find "$GITHUB_WORKSPACE" \
+              -path "$GITHUB_WORKSPACE/.git" -prune -o \
+              \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+              -type f -print | head -n 1 || true)"
+
+            if [[ -n "$SETTINGS_FILE" ]]; then
+              PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+            else
+              ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
+                -path "$GITHUB_WORKSPACE/.git" -prune -o \
+                -type f -name '*.zip' -print | head -n 1 || true)"
+
+              if [[ -z "$ZIP_FILE" ]]; then
+                echo "::error::No Android Gradle project or ZIP file found."
+                exit 1
+              fi
+
+              EXTRACT_DIR="$RUNNER_TEMP/popup-launcher-project"
+              rm -rf "$EXTRACT_DIR"
+              mkdir -p "$EXTRACT_DIR"
+
+              echo "Extracting: $ZIP_FILE"
+              unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+              SETTINGS_FILE="$(find "$EXTRACT_DIR" \
+                -path '*/.gradle/*' -prune -o \
+                \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+                -type f -print | head -n 1 || true)"
+
+              if [[ -z "$SETTINGS_FILE" ]]; then
+                echo "::error::settings.gradle(.kts) not found."
+                exit 1
+              fi
+
+              PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+            fi
+          fi
+
+          echo "Project directory: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-${{ env.ANDROID_API }}
+            build-tools;${{ env.BUILD_TOOLS }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-disabled: true
+
+      - name: Verify toolchain
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== Java ====="
+          java -version
+
+          echo "===== Gradle ====="
+          gradle --version
+
+          echo "===== Android SDK ====="
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+
+          sdkmanager --list_installed | sed -n '1,140p' || true
+
+      - name: Validate project structure
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -f "settings.gradle.kts" || -f "settings.gradle" ]]
+          [[ -f "build.gradle.kts" || -f "build.gradle" ]]
+          [[ -d "app" ]]
+          [[ -f "app/build.gradle.kts" || -f "app/build.gradle" ]]
+          [[ -f "app/src/main/AndroidManifest.xml" ]]
+
+          echo "Project structure OK."
+
+      - name: Validate Android configuration
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_GRADLE="app/build.gradle.kts"
+          MANIFEST="app/src/main/AndroidManifest.xml"
+
+          [[ -f "$APP_GRADLE" ]]
+          [[ -f "$MANIFEST" ]]
+
+          grep -q 'minSdk = 24' "$APP_GRADLE"
+          grep -q 'targetSdk = 35' "$APP_GRADLE"
+          grep -q 'isMinifyEnabled = true' "$APP_GRADLE"
+          grep -q 'isShrinkResources = true' "$APP_GRADLE"
+
+          grep -q 'android:foregroundServiceType="specialUse"' "$MANIFEST"
+          grep -q 'PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "$MANIFEST"
+
+          echo "Android configuration OK."
+
+      - name: Validate source files
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AIDL="app/src/main/aidl/com/example/popuplauncher/IShellCommandService.aidl"
+
+          [[ -f "$AIDL" ]]
+
+          find app/src/main \
+            -type f \
+            \( -name '*.kt' -o -name '*.xml' -o -name '*.aidl' \) \
+            -print0 \
+            | xargs -0 -r grep -Il $'\xEF\xBF\xBD' \
+            >/tmp/bad-unicode.txt || true
+
+          if [[ -s /tmp/bad-unicode.txt ]]; then
+            echo "::error::Replacement character U+FFFD found:"
+            cat /tmp/bad-unicode.txt
+            exit 1
+          fi
+
+          echo "Source sanity checks OK."
+
+      - name: Android Lint
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: gradle --no-daemon --stacktrace :app:lintDebug
+
+      - name: Unit tests
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Build Debug APK
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Build Release APK
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: gradle --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Verify APK outputs
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEBUG_APK="$(find app/build/outputs/apk/debug \
+            -maxdepth 1 -type f -name '*.apk' -print | head -n 1 || true)"
+
+          RELEASE_APK="$(find app/build/outputs/apk/release \
+            -maxdepth 1 -type f -name '*.apk' -print | head -n 1 || true)"
+
+          if [[ -z "$DEBUG_APK" ]]; then
+            echo "::error::Debug APK was not generated."
+            exit 1
+          fi
+
+          if [[ -z "$RELEASE_APK" ]]; then
+            echo "::error::Release APK was not generated."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          cp "$DEBUG_APK" \
+            "$GITHUB_WORKSPACE/artifacts/PopupLauncher-debug.apk"
+
+          cp "$RELEASE_APK" \
+            "$GITHUB_WORKSPACE/artifacts/PopupLauncher-release.apk"
+
+          cd "$GITHUB_WORKSPACE/artifacts"
+
+          sha256sum *.apk > SHA256SUMS.txt
+
+          echo "===== APKs ====="
+          ls -lh *.apk
+
+          echo "===== SHA-256 ====="
+          cat SHA256SUMS.txt
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PopupLauncher-debug-${{ github.sha }}
+          path: artifacts/PopupLauncher-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PopupLauncher-release-${{ github.sha }}
+          path: artifacts/PopupLauncher-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload SHA256 checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: PopupLauncher-checksums-${{ github.sha }}
+          path: artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
